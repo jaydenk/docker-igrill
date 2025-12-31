@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  igrill:
+    build: .
+    container_name: igrill-service
+    environment:
+      - IGRILL_PORT=${IGRILL_PORT:-39120}
+      - IGRILL_POLL_INTERVAL=${IGRILL_POLL_INTERVAL:-15}
+      - IGRILL_TIMEOUT=${IGRILL_TIMEOUT:-30}
+      - IGRILL_MAC_PREFIX=${IGRILL_MAC_PREFIX:-70:91:8F}
+      - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+    ports:
+      - "${IGRILL_PORT:-39120}:${IGRILL_PORT:-39120}"
+    volumes:
+      - /run/dbus:/run/dbus
+    restart: unless-stopped

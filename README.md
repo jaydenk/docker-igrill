@@ -1,7 +1,59 @@
-# esphome-igrill
+# docker-igrill
 
-ESPHome Custom Component for the iGrill Bluetooth Thermometers
-This component will let you use a supported ESP32 to read sensor values from IGrill bluetooth thermometers and Pulse BBQ's.
+Standalone BLE polling service for iGrill devices that exposes JSON metrics over HTTP. The ESPHome implementation in `components/` remains as a protocol reference.
+
+## Quick Start (Docker Compose)
+```sh
+docker-compose up -d --build
+curl http://localhost:39120/metrics
+```
+
+## Configuration
+- `IGRILL_PORT` (default `39120`): HTTP port for `/metrics`.
+- `IGRILL_POLL_INTERVAL` (default `15`): polling interval in seconds (min 5, max 60).
+- `IGRILL_TIMEOUT` (default `30`): read/connect timeout in seconds.
+- `IGRILL_MAC_PREFIX` (default `70:91:8F`): scan prefix for device MAC addresses.
+- `IGRILL_BIND_ADDRESS` (default `0.0.0.0`): bind address for the HTTP server.
+- `IGRILL_SCAN_INTERVAL` (default `60`): BLE scan interval in seconds.
+- `IGRILL_SCAN_TIMEOUT` (default `5`): BLE scan duration in seconds.
+
+## API
+`GET /metrics` returns the latest readings for all discovered devices.
+
+Example response:
+```json
+{
+  "generated_at": "2024-01-01T12:00:00+00:00",
+  "device_count": 1,
+  "devices": [
+    {
+      "address": "70:91:8F:AA:BB:CC",
+      "name": "iGrill_v3",
+      "model": "igrill_v3",
+      "model_name": "IGrill V3",
+      "connected": true,
+      "last_seen": "2024-01-01T12:00:00+00:00",
+      "last_update": "2024-01-01T12:00:15+00:00",
+      "unit": "F",
+      "battery_percent": 92,
+      "propane_percent": null,
+      "probes": [
+        { "index": 1, "temperature": 145.0, "raw": 145, "unplugged": false }
+      ],
+      "pulse": {},
+      "error": null,
+      "rssi": -62
+    }
+  ]
+}
+```
+
+## BLE Host Requirements
+- Host must run BlueZ; mount `/run/dbus` into the container and set `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket`.
+- The container must be able to access the host Bluetooth adapter (run as root in Docker by default).
+
+## ESPHome Reference
+The sections below describe the original ESPHome external component kept in `components/` for reference.
 
 ## Installation
 
