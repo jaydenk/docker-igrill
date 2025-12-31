@@ -62,6 +62,13 @@ Example response:
 }
 ```
 
+### WebSocket Streaming
+For real-time streaming, connect to `/ws`. The server sends:
+- `snapshot` on connect with all known devices.
+- `device_update` for each poll cycle with the latest readings.
+
+Note: `curl` does not support WebSockets. Use a client like `websocat` or `wscat`, or an iOS `URLSessionWebSocketTask`.
+
 ## BLE Host Requirements
 - Host must run BlueZ; mount `/run/dbus` into the container and set `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket`.
 - The container must be able to access the host Bluetooth adapter (run as root in Docker by default).

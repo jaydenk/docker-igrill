@@ -100,6 +100,7 @@ class DeviceStore:
     def __init__(self) -> None:
         self._devices: Dict[str, Dict[str, object]] = {}
         self._lock = asyncio.Lock()
+        self._updates: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=1000)
 
     async def upsert(self, address: str, **fields: object) -> None:
         async with self._lock:
@@ -123,10 +124,25 @@ class DeviceStore:
                 },
             )
             entry.update(fields)
+            if "last_update" in fields:
+                payload = {
+                    "type": "device_update",
+                    "generated_at": now_iso(),
+                    "device": dict(entry),
+                }
+                if self._updates.full():
+                    try:
+                        self._updates.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                self._updates.put_nowait(payload)
 
     async def snapshot(self) -> Dict[str, Dict[str, object]]:
         async with self._lock:
             return {key: dict(value) for key, value in self._devices.items()}
+
+    async def next_update(self) -> Dict[str, object]:
+        return await self._updates.get()
 
 
 class DeviceWorker:
@@ -399,17 +415,61 @@ async def metrics_handler(request: web.Request) -> web.Response:
         }
     )
 
+async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
+    store: DeviceStore = request.app["store"]
+    websockets: set = request.app["websockets"]
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    websockets.add(ws)
+    snapshot = await store.snapshot()
+    await ws.send_json(
+        {
+            "type": "snapshot",
+            "generated_at": now_iso(),
+            "devices": list(snapshot.values()),
+        }
+    )
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.ERROR:
+                LOG.debug("WebSocket error: %s", ws.exception())
+    finally:
+        websockets.discard(ws)
+    return ws
 
-async def start_server(store: DeviceStore, host: str, port: int) -> web.AppRunner:
+
+async def broadcast_updates(app: web.Application) -> None:
+    store: DeviceStore = app["store"]
+    websockets: set = app["websockets"]
+    while True:
+        update = await store.next_update()
+        if not websockets:
+            continue
+        stale = []
+        for ws in websockets:
+            if ws.closed:
+                stale.append(ws)
+                continue
+            try:
+                await ws.send_json(update)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            websockets.discard(ws)
+
+
+async def start_server(store: DeviceStore, host: str, port: int) -> tuple[web.AppRunner, web.Application]:
     app = web.Application()
     app["store"] = store
+    app["websockets"] = set()
     app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/ws", websocket_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
     LOG.info("HTTP server listening on %s:%d", host, port)
-    return runner
+    return runner, app
 
 
 async def run() -> None:
@@ -447,7 +507,8 @@ async def run() -> None:
         scan_timeout=scan_timeout,
     )
 
-    runner = await start_server(store, bind_address, port)
+    runner, app = await start_server(store, bind_address, port)
+    broadcast_task = asyncio.create_task(broadcast_updates(app))
     scan_task = asyncio.create_task(manager.scan_loop())
 
     stop_event = asyncio.Event()
@@ -460,7 +521,11 @@ async def run() -> None:
 
     await stop_event.wait()
     scan_task.cancel()
+    broadcast_task.cancel()
     await asyncio.gather(scan_task, return_exceptions=True)
+    await asyncio.gather(broadcast_task, return_exceptions=True)
+    for ws in list(app["websockets"]):
+        await ws.close()
     await manager.stop()
     await runner.cleanup()
 
