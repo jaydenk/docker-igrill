@@ -16,6 +16,7 @@ curl http://localhost:39120/metrics
 - `IGRILL_BIND_ADDRESS` (default `0.0.0.0`): bind address for the HTTP server.
 - `IGRILL_SCAN_INTERVAL` (default `60`): BLE scan interval in seconds.
 - `IGRILL_SCAN_TIMEOUT` (default `5`): BLE scan duration in seconds.
+- `IGRILL_LOG_LEVEL` (default `INFO`): set to `DEBUG` for BLE connection and sensor read logs.
 
 ## API
 `GET /metrics` returns the latest readings for all discovered devices.

@@ -132,16 +132,22 @@ class DeviceWorker:
     def __init__(
         self,
         address: str,
+        name: Optional[str],
         store: DeviceStore,
         poll_interval: int,
         timeout: int,
     ) -> None:
         self.address = address
+        self.name = name
         self.store = store
         self.poll_interval = poll_interval
         self.timeout = timeout
         self._model: Optional[ModelInfo] = None
         self._stop = asyncio.Event()
+
+    def update_name(self, name: Optional[str]) -> None:
+        if name:
+            self.name = name
 
     async def stop(self) -> None:
         self._stop.set()
@@ -149,13 +155,16 @@ class DeviceWorker:
     async def run(self) -> None:
         while not self._stop.is_set():
             try:
+                LOG.debug("Connecting to %s (%s)", self.address, self.name or "unknown")
                 async with BleakClient(self.address, timeout=self.timeout) as client:
+                    LOG.info("Connected to %s (%s)", self.address, self.name or "unknown")
                     services = await client.get_services()
                     self._model = detect_model(services)
                     await self._update_model_state()
                     await self._authenticate(client, services)
                     await self._poll_loop(client, services)
                     await self.store.upsert(self.address, connected=False)
+                    LOG.info("Disconnected from %s (%s)", self.address, self.name or "unknown")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -193,8 +202,10 @@ class DeviceWorker:
         ):
             LOG.warning("Device %s missing authentication characteristics", self.address)
             return
+        LOG.debug("Sending auth challenge to %s", self.address)
         await client.write_gatt_char(APP_CHALLENGE_UUID, bytes(16), response=True)
         challenge = await client.read_gatt_char(DEVICE_CHALLENGE_UUID)
+        LOG.debug("Received device challenge from %s: %s", self.address, challenge.hex())
         await client.write_gatt_char(DEVICE_RESPONSE_UUID, challenge, response=True)
 
     async def _poll_loop(self, client: BleakClient, services) -> None:
@@ -212,34 +223,50 @@ class DeviceWorker:
         unit_data = await self._read_char(client, TEMPERATURE_UNIT_UUID, services)
         if unit_data:
             payload["unit"] = "F" if unit_data[0] == 0 else "C"
+            LOG.debug("Unit for %s: %s", self.address, payload["unit"])
 
         battery_data = await self._read_char(client, BATTERY_LEVEL_UUID, services)
         if battery_data:
             payload["battery_percent"] = battery_data[0]
+            LOG.debug("Battery for %s: %s", self.address, payload["battery_percent"])
 
         propane_data = await self._read_char(client, PROPANE_LEVEL_UUID, services)
         if propane_data:
             payload["propane_percent"] = propane_data[0] * 25
+            LOG.debug("Propane for %s: %s", self.address, payload["propane_percent"])
 
         probes = []
         for index, uuid in enumerate(probe_uuids, start=1):
             probe_data = await self._read_char(client, uuid, services)
             if not probe_data:
                 continue
-            probes.append(parse_temperature_probe(index, probe_data))
+            probe = parse_temperature_probe(index, probe_data)
+            probes.append(probe)
+            LOG.debug(
+                "Probe %s %d: temp=%s raw=%s unplugged=%s",
+                self.address,
+                index,
+                probe.get("temperature"),
+                probe.get("raw"),
+                probe.get("unplugged"),
+            )
         payload["probes"] = probes
 
         if self._model and self._model.is_pulse:
             pulse_data = await self._read_char(client, PULSE_ELEMENT_UUID, services)
             if pulse_data:
-                payload["pulse"] = parse_pulse_element(pulse_data)
+                pulse = parse_pulse_element(pulse_data)
+                payload["pulse"] = pulse
+                LOG.debug("Pulse values for %s: %s", self.address, pulse)
         return payload
 
     async def _read_char(self, client: BleakClient, uuid: str, services) -> Optional[bytes]:
         if services.get_characteristic(uuid) is None:
             return None
         try:
-            return await asyncio.wait_for(client.read_gatt_char(uuid), timeout=self.timeout)
+            data = await asyncio.wait_for(client.read_gatt_char(uuid), timeout=self.timeout)
+            LOG.debug("Read %s from %s: %s", uuid, self.address, data.hex())
+            return data
         except asyncio.TimeoutError:
             LOG.warning("Timeout reading %s from %s", uuid, self.address)
             return None
@@ -277,6 +304,7 @@ class DeviceManager:
                     address = device.address
                     if not address.lower().startswith(self.mac_prefix):
                         continue
+                    LOG.debug("Discovered %s (%s) rssi=%s", address, device.name, getattr(device, "rssi", None))
                     await self.store.upsert(
                         address,
                         name=device.name,
@@ -284,9 +312,11 @@ class DeviceManager:
                         rssi=getattr(device, "rssi", None),
                     )
                     if address not in self._workers:
-                        worker = DeviceWorker(address, self.store, self.poll_interval, self.timeout)
+                        worker = DeviceWorker(address, device.name, self.store, self.poll_interval, self.timeout)
                         self._workers[address] = worker
                         self._tasks[address] = asyncio.create_task(worker.run())
+                    else:
+                        self._workers[address].update_name(device.name)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -365,10 +395,12 @@ async def start_server(store: DeviceStore, host: str, port: int) -> web.AppRunne
 
 
 async def run() -> None:
+    log_level_name = os.getenv("IGRILL_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=log_level_name,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("bleak").setLevel(log_level_name)
     port = read_int_env("IGRILL_PORT", DEFAULT_PORT)
     poll_interval = read_int_env("IGRILL_POLL_INTERVAL", DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
     timeout = read_int_env("IGRILL_TIMEOUT", DEFAULT_TIMEOUT)
