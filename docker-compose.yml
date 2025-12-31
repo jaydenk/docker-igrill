@@ -13,4 +13,5 @@ services:
       - "${IGRILL_PORT:-39120}:${IGRILL_PORT:-39120}"
     volumes:
       - /run/dbus:/run/dbus
+      - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped
