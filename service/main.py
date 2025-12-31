@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -223,17 +224,14 @@ class DeviceWorker:
         unit_data = await self._read_char(client, TEMPERATURE_UNIT_UUID, services)
         if unit_data:
             payload["unit"] = "F" if unit_data[0] == 0 else "C"
-            LOG.debug("Unit for %s: %s", self.address, payload["unit"])
 
         battery_data = await self._read_char(client, BATTERY_LEVEL_UUID, services)
         if battery_data:
             payload["battery_percent"] = battery_data[0]
-            LOG.debug("Battery for %s: %s", self.address, payload["battery_percent"])
 
         propane_data = await self._read_char(client, PROPANE_LEVEL_UUID, services)
         if propane_data:
             payload["propane_percent"] = propane_data[0] * 25
-            LOG.debug("Propane for %s: %s", self.address, payload["propane_percent"])
 
         probes = []
         for index, uuid in enumerate(probe_uuids, start=1):
@@ -242,22 +240,22 @@ class DeviceWorker:
                 continue
             probe = parse_temperature_probe(index, probe_data)
             probes.append(probe)
-            LOG.debug(
-                "Probe %s %d: temp=%s raw=%s unplugged=%s",
-                self.address,
-                index,
-                probe.get("temperature"),
-                probe.get("raw"),
-                probe.get("unplugged"),
-            )
         payload["probes"] = probes
+        device_label = self.name or (self._model.label if self._model else "unknown")
+        if probes:
+            LOG.debug(
+                "%s mac_address: %s last_update: %s probes: %s",
+                device_label,
+                self.address,
+                payload["last_update"],
+                json.dumps(probes),
+            )
 
         if self._model and self._model.is_pulse:
             pulse_data = await self._read_char(client, PULSE_ELEMENT_UUID, services)
             if pulse_data:
                 pulse = parse_pulse_element(pulse_data)
                 payload["pulse"] = pulse
-                LOG.debug("Pulse values for %s: %s", self.address, pulse)
         return payload
 
     async def _read_char(self, client: BleakClient, uuid: str, services) -> Optional[bytes]:
