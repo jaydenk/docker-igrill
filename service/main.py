@@ -160,7 +160,12 @@ class DeviceWorker:
                 LOG.debug("Connecting to %s (%s)", self.address, self.name or "unknown")
                 async with BleakClient(self.address, timeout=self.timeout) as client:
                     self._connected_logged = False
-                    services = await client.get_services()
+                    services = client.services
+                    if services is None:
+                        LOG.warning("No services discovered for %s", self.address)
+                        await self.store.upsert(self.address, connected=False, error="services_unavailable")
+                        await asyncio.sleep(3)
+                        continue
                     self._model = detect_model(services)
                     await self._update_model_state()
                     await self._authenticate(client, services)
@@ -315,26 +320,28 @@ class DeviceManager:
     async def scan_loop(self) -> None:
         while True:
             try:
-                devices = await BleakScanner.discover(timeout=self.scan_timeout)
-                for device in devices:
+                devices = await BleakScanner.discover(timeout=self.scan_timeout, return_adv=True)
+                for device, adv_data in devices:
                     if not device.address:
                         continue
                     address = device.address
+                    name = device.name or getattr(adv_data, "local_name", None)
+                    rssi = getattr(adv_data, "rssi", None)
                     if not address.lower().startswith(self.mac_prefix):
                         continue
-                    LOG.debug("Discovered %s (%s) rssi=%s", address, device.name, getattr(device, "rssi", None))
+                    LOG.debug("Discovered %s (%s) rssi=%s", address, name, rssi)
                     await self.store.upsert(
                         address,
-                        name=device.name,
+                        name=name,
                         last_seen=now_iso(),
-                        rssi=getattr(device, "rssi", None),
+                        rssi=rssi,
                     )
                     if address not in self._workers:
-                        worker = DeviceWorker(address, device.name, self.store, self.poll_interval, self.timeout)
+                        worker = DeviceWorker(address, name, self.store, self.poll_interval, self.timeout)
                         self._workers[address] = worker
                         self._tasks[address] = asyncio.create_task(worker.run())
                     else:
-                        self._workers[address].update_name(device.name)
+                        self._workers[address].update_name(name)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
