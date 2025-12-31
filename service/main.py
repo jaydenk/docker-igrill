@@ -145,6 +145,7 @@ class DeviceWorker:
         self.timeout = timeout
         self._model: Optional[ModelInfo] = None
         self._stop = asyncio.Event()
+        self._connected_logged = False
 
     def update_name(self, name: Optional[str]) -> None:
         if name:
@@ -158,14 +159,13 @@ class DeviceWorker:
             try:
                 LOG.debug("Connecting to %s (%s)", self.address, self.name or "unknown")
                 async with BleakClient(self.address, timeout=self.timeout) as client:
-                    LOG.info("Connected to %s (%s)", self.address, self.name or "unknown")
+                    self._connected_logged = False
                     services = await client.get_services()
                     self._model = detect_model(services)
                     await self._update_model_state()
                     await self._authenticate(client, services)
                     await self._poll_loop(client, services)
                     await self.store.upsert(self.address, connected=False)
-                    LOG.info("Disconnected from %s (%s)", self.address, self.name or "unknown")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -242,6 +242,26 @@ class DeviceWorker:
             probes.append(probe)
         payload["probes"] = probes
         device_label = self.name or (self._model.label if self._model else "unknown")
+        if not self._connected_logged:
+            connected_probes = [
+                probe["index"]
+                for probe in probes
+                if probe.get("unplugged") is False
+            ]
+            LOG.info(
+                "%s mac_address: %s connected_probes: %s",
+                device_label,
+                self.address,
+                json.dumps(connected_probes),
+            )
+            self._connected_logged = True
+        LOG.info(
+            "%s mac_address: %s last_update: %s probes: %s",
+            device_label,
+            self.address,
+            payload["last_update"],
+            json.dumps(probes),
+        )
         if probes:
             LOG.debug(
                 "%s mac_address: %s last_update: %s probes: %s",
