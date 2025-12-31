@@ -18,6 +18,17 @@ curl http://localhost:39120/metrics
 - `IGRILL_SCAN_TIMEOUT` (default `5`): BLE scan duration in seconds.
 - `IGRILL_LOG_LEVEL` (default `INFO`): set to `DEBUG` for BLE connection and sensor read logs.
 
+| Variable | Default | Possible values | Notes |
+| --- | --- | --- | --- |
+| `IGRILL_PORT` | `39120` | integer (1-65535) | HTTP port for `/metrics`. |
+| `IGRILL_POLL_INTERVAL` | `15` | integer (5-60) | Polling interval in seconds. |
+| `IGRILL_TIMEOUT` | `30` | integer (>=1) | GATT read/connect timeout in seconds. |
+| `IGRILL_MAC_PREFIX` | `70:91:8F` | MAC prefix string | Prefix used to filter devices during scans. |
+| `IGRILL_BIND_ADDRESS` | `0.0.0.0` | IP address | Bind address for the HTTP server. |
+| `IGRILL_SCAN_INTERVAL` | `60` | integer (>=1) | Time between BLE scans in seconds. |
+| `IGRILL_SCAN_TIMEOUT` | `5` | integer (>=1) | Duration of each BLE scan in seconds. |
+| `IGRILL_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | Controls log verbosity for the service and BLE layer. |
+
 ## API
 `GET /metrics` returns the latest readings for all discovered devices.
 

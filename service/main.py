@@ -75,7 +75,7 @@ MODELS: List[ModelInfo] = [
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def clamp_int(value: int, min_value: int, max_value: int) -> int:
