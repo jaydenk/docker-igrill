@@ -50,3 +50,4 @@ sdkconfig.lolin_c3_mini
 
 *.DS_Store
 AGENTS.md
+.env

@@ -9,6 +9,8 @@ curl http://localhost:39120/metrics
 ```
 
 ## Configuration
+To override defaults with a file, copy `env.example` to `.env` and edit values.
+
 - `IGRILL_PORT` (default `39120`): HTTP port for `/metrics`.
 - `IGRILL_POLL_INTERVAL` (default `15`): polling interval in seconds (min 5, max 60).
 - `IGRILL_TIMEOUT` (default `30`): read/connect timeout in seconds.
