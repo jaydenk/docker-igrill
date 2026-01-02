@@ -14,6 +14,7 @@ services:
       - IGRILL_LOG_LEVEL=${IGRILL_LOG_LEVEL:-INFO}
       - IGRILL_RECONNECT_GRACE=${IGRILL_RECONNECT_GRACE:-60}
       - IGRILL_DB_PATH=${IGRILL_DB_PATH:-/data/igrill.db}
+      - IGRILL_SESSION_TOKEN=${IGRILL_SESSION_TOKEN:-}
       - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
     ports:
       - "${IGRILL_PORT:-39120}:${IGRILL_PORT:-39120}"

@@ -116,6 +116,7 @@ class DeviceStore:
         self._devices: Dict[str, Dict[str, object]] = {}
         self._lock = asyncio.Lock()
         self._reading_queue: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=1000)
+        self._event_queue: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=1000)
 
     async def upsert(self, address: str, **fields: object) -> None:
         async with self._lock:
@@ -128,6 +129,7 @@ class DeviceStore:
                     "model_name": None,
                     "connected": False,
                     "session_id": None,
+                    "session_start_ts": None,
                     "last_seen": None,
                     "last_update": None,
                     "unit": None,
@@ -164,18 +166,37 @@ class DeviceStore:
     async def next_reading(self) -> Dict[str, object]:
         return await self._reading_queue.get()
 
+    async def publish_event(self, event: Dict[str, object]) -> None:
+        if self._event_queue.full():
+            try:
+                self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self._event_queue.put_nowait(event)
+
+    async def next_event(self) -> Dict[str, object]:
+        return await self._event_queue.get()
+
 
 class HistoryStore:
     def __init__(self, db_path: str, reconnect_grace: int) -> None:
         self._db_path = db_path
         self._reconnect_grace = reconnect_grace
         self._lock = asyncio.Lock()
+        self._current_session_id: Optional[int] = None
+        self._current_session_start_ts: Optional[str] = None
+        self._last_session_id: Optional[int] = None
+        self._last_activity_ts: Optional[datetime] = None
+        self._last_disconnect_ts: Optional[datetime] = None
+        self._last_disconnect_sensor: Optional[str] = None
+        self._started_from_restart = False
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
+        self._load_session_state()
 
     def _init_schema(self) -> None:
         self._conn.execute(
@@ -186,7 +207,9 @@ class HistoryStore:
                 name TEXT,
                 model TEXT,
                 started_at TEXT NOT NULL,
-                ended_at TEXT
+                ended_at TEXT,
+                start_reason TEXT,
+                end_reason TEXT
             )
             """
         )
@@ -198,6 +221,7 @@ class HistoryStore:
                 address TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
                 seq INTEGER,
+                session_start_ts TEXT,
                 unit TEXT,
                 battery_percent REAL,
                 propane_percent REAL,
@@ -212,6 +236,9 @@ class HistoryStore:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_session ON readings(session_id)")
         self._ensure_column("readings", "seq", "seq INTEGER")
         self._ensure_column("readings", "data_json", "data_json TEXT")
+        self._ensure_column("readings", "session_start_ts", "session_start_ts TEXT")
+        self._ensure_column("sessions", "start_reason", "start_reason TEXT")
+        self._ensure_column("sessions", "end_reason", "end_reason TEXT")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -222,71 +249,195 @@ class HistoryStore:
         if column not in columns:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
-    async def ensure_session(
+    def _load_session_state(self) -> None:
+        now_ts = now_iso_utc()
+        row = self._conn.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            self._last_session_id = row["id"]
+            if row["ended_at"] is None:
+                self._conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                    (now_ts, "server_restart", row["id"]),
+                )
+                self._conn.commit()
+                self._last_session_id = row["id"]
+        has_history = self._conn.execute("SELECT 1 FROM readings LIMIT 1").fetchone()
+        self._started_from_restart = has_history is not None
+        session_id = self._conn.execute(
+            "INSERT INTO sessions (address, started_at, start_reason) VALUES (?, ?, ?)",
+            ("global", now_ts, "server_restart"),
+        )
+        self._conn.commit()
+        session_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self._current_session_id = int(session_id)
+        self._current_session_start_ts = now_ts
+
+    async def _create_session(self, start_ts: str, reason: str) -> int:
+        self._conn.execute(
+            "INSERT INTO sessions (address, started_at, start_reason) VALUES (?, ?, ?)",
+            ("global", start_ts, reason),
+        )
+        session_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self._conn.commit()
+        self._current_session_id = int(session_id)
+        self._current_session_start_ts = start_ts
+        self._last_activity_ts = None
+        return int(session_id)
+
+    async def _end_session(self, end_ts: str, reason: str) -> Optional[int]:
+        if self._current_session_id is None:
+            return None
+        session_id = self._current_session_id
+        self._conn.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+            (end_ts, reason, session_id),
+        )
+        self._conn.commit()
+        self._last_session_id = session_id
+        self._current_session_id = None
+        self._current_session_start_ts = None
+        return session_id
+
+    async def ensure_session_for_reading(
         self,
-        address: str,
-        name: Optional[str],
-        model: Optional[str],
-        now_value: str,
-    ) -> int:
-        now_dt = parse_iso(now_value) or datetime.now().astimezone()
+        now_ts: str,
+        sensor_id: Optional[str],
+    ) -> Dict[str, object]:
+        now_dt = parse_iso(now_ts) or datetime.now(timezone.utc)
         async with self._lock:
-            row = self._conn.execute(
-                "SELECT id, ended_at FROM sessions WHERE address = ? ORDER BY started_at DESC LIMIT 1",
-                (address,),
-            ).fetchone()
-            session_id = None
-            if row:
-                ended_at = row["ended_at"]
-                if ended_at is None:
-                    last_read = self._conn.execute(
-                        "SELECT recorded_at FROM readings WHERE session_id = ? ORDER BY recorded_at DESC LIMIT 1",
-                        (row["id"],),
-                    ).fetchone()
-                    last_read_dt = parse_iso(last_read["recorded_at"]) if last_read else None
-                    if last_read_dt and (now_dt - last_read_dt).total_seconds() > self._reconnect_grace:
-                        self._conn.execute(
-                            "UPDATE sessions SET ended_at = ? WHERE id = ?",
-                            (last_read["recorded_at"], row["id"]),
-                        )
-                    else:
-                        session_id = row["id"]
+            rolled = False
+            end_event = None
+            start_event = None
+            reason_start = "sensor_reconnect"
+            if self._current_session_id is None:
+                if self._started_from_restart:
+                    reason_start = "server_restart"
+                session_id = await self._create_session(now_ts, reason_start)
+                start_event = {
+                    "sensorId": sensor_id,
+                    "sessionId": session_id,
+                    "sessionStartTs": now_ts,
+                    "reason": reason_start,
+                }
+            elif self._last_activity_ts and (now_dt - self._last_activity_ts).total_seconds() > self._reconnect_grace:
+                rolled = True
+                duration_seconds = None
+                if self._current_session_start_ts:
+                    start_dt = parse_iso(self._current_session_start_ts)
+                    if start_dt:
+                        duration_seconds = int((now_dt - start_dt).total_seconds())
+                end_reason = "idle_timeout"
+                if self._last_disconnect_ts:
+                    if (now_dt - self._last_disconnect_ts).total_seconds() >= self._reconnect_grace:
+                        end_reason = "sensor_disconnect"
+                end_session_id = await self._end_session(now_ts, end_reason)
+                end_event = {
+                    "sensorId": sensor_id,
+                    "sessionId": end_session_id,
+                    "sessionEndTs": now_ts,
+                    "reason": end_reason,
+                }
+                if duration_seconds is not None:
+                    end_event["durationSeconds"] = duration_seconds
+                session_id = await self._create_session(now_ts, "sensor_reconnect")
+                start_event = {
+                    "sensorId": sensor_id,
+                    "sessionId": session_id,
+                    "sessionStartTs": now_ts,
+                    "reason": "sensor_reconnect",
+                }
+            elif self._last_activity_ts is None and self._current_session_start_ts:
+                start_dt = parse_iso(self._current_session_start_ts)
+                if start_dt and (now_dt - start_dt).total_seconds() > self._reconnect_grace:
+                    rolled = True
+                    end_reason = "idle_timeout"
+                    if self._last_disconnect_ts:
+                        if (now_dt - self._last_disconnect_ts).total_seconds() >= self._reconnect_grace:
+                            end_reason = "sensor_disconnect"
+                    end_event = {
+                        "sensorId": sensor_id,
+                        "sessionId": self._current_session_id,
+                        "sessionEndTs": now_ts,
+                        "reason": end_reason,
+                        "durationSeconds": int((now_dt - start_dt).total_seconds()),
+                    }
+                    await self._end_session(now_ts, end_reason)
+                    session_id = await self._create_session(now_ts, "sensor_reconnect")
+                    start_event = {
+                        "sensorId": sensor_id,
+                        "sessionId": session_id,
+                        "sessionStartTs": now_ts,
+                        "reason": "sensor_reconnect",
+                    }
                 else:
-                    ended_dt = parse_iso(ended_at)
-                    if ended_dt and (now_dt - ended_dt).total_seconds() <= self._reconnect_grace:
-                        self._conn.execute("UPDATE sessions SET ended_at = NULL WHERE id = ?", (row["id"],))
-                        session_id = row["id"]
-
-            if session_id is None:
-                self._conn.execute(
-                    "INSERT INTO sessions (address, name, model, started_at) VALUES (?, ?, ?, ?)",
-                    (address, name, model, now_value),
-                )
-                session_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    session_id = self._current_session_id
             else:
-                self._conn.execute(
-                    "UPDATE sessions SET name = ?, model = ? WHERE id = ?",
-                    (name, model, session_id),
-                )
-            self._conn.commit()
-            return int(session_id)
+                session_id = self._current_session_id
+            self._last_activity_ts = now_dt
+            if session_id is None:
+                session_id = await self._create_session(now_ts, reason_start)
+                start_event = {
+                    "sensorId": sensor_id,
+                    "sessionId": session_id,
+                    "sessionStartTs": now_ts,
+                    "reason": reason_start,
+                }
+            return {
+                "session_id": session_id,
+                "session_start_ts": self._current_session_start_ts,
+                "rolled": rolled,
+                "end_event": end_event,
+                "start_event": start_event,
+            }
 
-    async def close_session(self, address: str, ended_at: str) -> None:
+    async def force_new_session(self, now_ts: str, sensor_id: Optional[str], reason: str) -> Dict[str, object]:
         async with self._lock:
-            self._conn.execute(
-                """
-                UPDATE sessions
-                SET ended_at = ?
-                WHERE id = (
-                    SELECT id FROM sessions
-                    WHERE address = ? AND ended_at IS NULL
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                )
-                """,
-                (ended_at, address),
-            )
-            self._conn.commit()
+            end_event = None
+            if self._current_session_id is not None:
+                duration_seconds = None
+                if self._current_session_start_ts:
+                    start_dt = parse_iso(self._current_session_start_ts)
+                    end_dt = parse_iso(now_ts)
+                    if start_dt and end_dt:
+                        duration_seconds = int((end_dt - start_dt).total_seconds())
+                end_session_id = await self._end_session(now_ts, reason)
+                end_event = {
+                    "sensorId": sensor_id,
+                    "sessionId": end_session_id,
+                    "sessionEndTs": now_ts,
+                    "reason": reason,
+                }
+                if duration_seconds is not None:
+                    end_event["durationSeconds"] = duration_seconds
+            session_id = await self._create_session(now_ts, reason)
+            start_event = {
+                "sensorId": sensor_id,
+                "sessionId": session_id,
+                "sessionStartTs": now_ts,
+                "reason": reason,
+            }
+            return {
+                "session_id": session_id,
+                "session_start_ts": self._current_session_start_ts,
+                "end_event": end_event,
+                "start_event": start_event,
+            }
+
+    async def get_session_state(self) -> Dict[str, object]:
+        async with self._lock:
+            return {
+                "current_session_id": self._current_session_id,
+                "current_session_start_ts": self._current_session_start_ts,
+                "last_session_id": self._last_session_id,
+                "session_timeout_seconds": self._reconnect_grace,
+            }
+
+    async def note_disconnect(self, sensor_id: Optional[str], ts: str) -> None:
+        async with self._lock:
+            self._last_disconnect_ts = parse_iso(ts)
+            self._last_disconnect_sensor = sensor_id
 
     async def record_reading(
         self,
@@ -295,6 +446,7 @@ class HistoryStore:
         payload: Dict[str, object],
         reading_data: Dict[str, object],
         seq: int,
+        session_start_ts: Optional[str],
     ) -> None:
         async with self._lock:
             self._conn.execute(
@@ -304,19 +456,21 @@ class HistoryStore:
                     address,
                     recorded_at,
                     seq,
+                    session_start_ts,
                     unit,
                     battery_percent,
                     propane_percent,
                     pulse_json,
                     probes_json,
                     data_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     address,
                     payload.get("last_update"),
                     seq,
+                    session_start_ts,
                     payload.get("unit"),
                     payload.get("battery_percent"),
                     payload.get("propane_percent"),
@@ -386,15 +540,20 @@ class HistoryStore:
         since_ts: Optional[str],
         until_ts: Optional[str],
         limit: Optional[int],
+        session_id: Optional[int],
     ) -> List[Dict[str, object]]:
         query = "SELECT * FROM readings WHERE 1=1"
         params: List[object] = []
-        if since_ts:
-            query += " AND recorded_at >= ?"
-            params.append(since_ts)
-        if until_ts:
-            query += " AND recorded_at <= ?"
-            params.append(until_ts)
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        else:
+            if since_ts:
+                query += " AND recorded_at >= ?"
+                params.append(since_ts)
+            if until_ts:
+                query += " AND recorded_at <= ?"
+                params.append(until_ts)
         query += " ORDER BY recorded_at ASC"
         if limit:
             query += " LIMIT ?"
@@ -421,10 +580,38 @@ class HistoryStore:
                 {
                     "ts": row["recorded_at"],
                     "seq": row["seq"],
+                    "sessionId": row["session_id"],
+                    "sessionStartTs": row["session_start_ts"],
+                    "payload": data,
                     "data": data,
                 }
             )
         return items
+
+    async def list_sessions(self, limit: int) -> List[Dict[str, object]]:
+        async with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, started_at, ended_at FROM sessions ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            session_ids = [row["id"] for row in rows]
+            counts = {}
+            if session_ids:
+                placeholders = ",".join("?" for _ in session_ids)
+                count_rows = self._conn.execute(
+                    f"SELECT session_id, COUNT(*) as count FROM readings WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                    session_ids,
+                ).fetchall()
+                counts = {row["session_id"]: row["count"] for row in count_rows}
+        return [
+            {
+                "sessionId": row["id"],
+                "startTs": row["started_at"],
+                "endTs": row["ended_at"],
+                "count": counts.get(row["id"], 0),
+            }
+            for row in rows
+        ]
 
 
 class DeviceWorker:
@@ -476,8 +663,8 @@ class DeviceWorker:
                     await self._update_model_state()
                     await self._authenticate(client, services)
                     await self._poll_loop(client, services)
+                    await self.history.note_disconnect(self.address, now_iso_utc())
                     await self.store.upsert(self.address, connected=False)
-                    await self.history.close_session(self.address, now_iso())
                     self._session_id = None
             except asyncio.CancelledError:
                 raise
@@ -488,9 +675,7 @@ class DeviceWorker:
                     connected=False,
                     error=str(exc),
                 )
-                if self._session_id is not None:
-                    await self.history.close_session(self.address, now_iso())
-                    self._session_id = None
+                await self.history.note_disconnect(self.address, now_iso_utc())
                 await asyncio.sleep(3)
 
     async def _update_model_state(self) -> None:
@@ -529,31 +714,49 @@ class DeviceWorker:
         probe_uuids = []
         if self._model:
             probe_uuids = PROBE_TEMPERATURE_UUIDS[: self._model.probe_count]
-        session_id = await self.history.ensure_session(
-            self.address,
-            self.name,
-            self._model.model_id if self._model else None,
-            now_iso(),
-        )
-        self._session_id = session_id
-        await self.store.upsert(self.address, session_id=session_id)
         while client.is_connected and not self._stop.is_set():
             payload = await self._read_metrics(client, services, probe_uuids)
+            now_ts = now_iso_utc()
+            session_info = await self.history.ensure_session_for_reading(now_ts, self.address)
+            session_id = session_info["session_id"]
+            session_start_ts = session_info["session_start_ts"]
+            self._session_id = session_id
             payload["session_id"] = session_id
-            await self.store.upsert(self.address, **payload)
+            payload["session_start_ts"] = session_start_ts
+            await self.store.upsert(
+                self.address,
+                session_id=session_id,
+                session_start_ts=session_start_ts,
+                **payload,
+            )
+            if session_info.get("end_event"):
+                await self.store.publish_event(make_envelope("session_end", session_info["end_event"]))
+            if session_info.get("start_event"):
+                await self.store.publish_event(make_envelope("session_start", session_info["start_event"]))
             self._seq += 1
             device_entry = await self.store.get_device(self.address)
             if device_entry is None:
                 await asyncio.sleep(self.poll_interval)
                 continue
-            reading_payload = build_reading_payload(device_entry)
+            reading_payload = build_reading_payload(
+                device_entry,
+                session_id=session_id,
+                session_start_ts=session_start_ts,
+            )
             await self.store.publish_reading(
                 {
                     "seq": self._seq,
                     "payload": reading_payload,
                 }
             )
-            await self.history.record_reading(session_id, self.address, payload, reading_payload, self._seq)
+            await self.history.record_reading(
+                session_id,
+                self.address,
+                payload,
+                reading_payload,
+                self._seq,
+                session_start_ts,
+            )
             await asyncio.sleep(self.poll_interval)
 
     async def _read_metrics(self, client: BleakClient, services, probe_uuids: List[str]) -> Dict[str, object]:
@@ -743,14 +946,15 @@ class WebSocketClient:
                 break
             await self.ws.send_json(message)
 
-    def enqueue(self, message: Dict[str, object]) -> None:
+    def enqueue(self, message: Dict[str, object], critical: bool = False) -> None:
         if self.queue.full():
             while not self.queue.empty():
                 try:
                     self.queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-        self.queue.put_nowait(message)
+        if not self.queue.full() or critical:
+            self.queue.put_nowait(message)
 
     async def close(self) -> None:
         if not self.task.done():
@@ -770,12 +974,12 @@ class WebSocketHub:
             self.clients.remove(client)
         await client.close()
 
-    def broadcast(self, message: Dict[str, object]) -> None:
+    def broadcast(self, message: Dict[str, object], critical: bool = False) -> None:
         for client in list(self.clients):
             if client.ws.closed:
                 self.clients.discard(client)
                 continue
-            client.enqueue(message)
+            client.enqueue(message, critical=critical)
 
 
 def detect_model(services) -> Optional[ModelInfo]:
@@ -816,12 +1020,17 @@ def parse_pulse_element(data: bytes) -> Dict[str, Optional[int]]:
     }
 
 
-def build_reading_payload(device_entry: Dict[str, object]) -> Dict[str, object]:
+def build_reading_payload(
+    device_entry: Dict[str, object],
+    session_id: Optional[int],
+    session_start_ts: Optional[str],
+) -> Dict[str, object]:
     data = {
         "name": device_entry.get("name"),
         "model": device_entry.get("model"),
         "model_name": device_entry.get("model_name"),
-        "session_id": device_entry.get("session_id"),
+        "session_id": session_id,
+        "session_start_ts": session_start_ts,
         "last_update": device_entry.get("last_update"),
         "unit": device_entry.get("unit"),
         "battery_percent": device_entry.get("battery_percent"),
@@ -834,6 +1043,8 @@ def build_reading_payload(device_entry: Dict[str, object]) -> Dict[str, object]:
     }
     payload = {
         "sensorId": device_entry.get("address"),
+        "sessionId": session_id,
+        "sessionStartTs": session_start_ts,
         "data": data,
     }
     q = {
@@ -887,6 +1098,18 @@ async def send_error(
     await send_envelope(ws, "error", payload, request_id=request_id)
 
 
+def is_authorized(request: web.Request) -> bool:
+    token = os.getenv("IGRILL_SESSION_TOKEN")
+    if not token:
+        return True
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        header_token = header.split(" ", 1)[1].strip()
+    else:
+        header_token = header.strip()
+    return header_token == token
+
+
 async def metrics_handler(request: web.Request) -> web.Response:
     store: DeviceStore = request.app["store"]
     snapshot = await store.snapshot()
@@ -920,11 +1143,20 @@ async def history_handler(request: web.Request) -> web.Response:
 # {"v":1,"type":"history_request","requestId":"h-1","payload":{"sinceTs":"2026-01-02T00:00:00+00:00","chunkSize":200}}
 # Server history chunk:
 # {"v":1,"type":"history_chunk","ts":"2026-01-02T01:00:00Z","requestId":"h-1","payload":{"items":[{"ts":"2026-01-02T01:00:00+00:00","seq":1,"data":{"sensorId":"70:91:8F:...","data":{"probes":[]}}}]}}
+# Client sessions request:
+# {"v":1,"type":"sessions_request","requestId":"sx-1","payload":{"limit":20}}
+# Server sessions response:
+# {"v":1,"type":"sessions","ts":"2026-01-02T01:00:00Z","requestId":"sx-1","payload":{"sessions":[{"sessionId":1,"startTs":"...","endTs":"...","count":120}]}}
+# Client session start request:
+# {"v":1,"type":"session_start_request","requestId":"ss-1","payload":{}}
+# Server session start ack:
+# {"v":1,"type":"session_start_ack","ts":"2026-01-02T01:00:00Z","requestId":"ss-1","payload":{"ok":true,"sessionId":2,"sessionStartTs":"..."}}
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     store: DeviceStore = request.app["store"]
     history: HistoryStore = request.app["history"]
     hub: WebSocketHub = request.app["hub"]
     poll_interval: int = request.app["poll_interval"]
+    authorized = is_authorized(request)
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     client = WebSocketClient(ws)
@@ -972,14 +1204,43 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                         device_state = "warming_up"
                     else:
                         device_state = "offline"
+                    session_state = await history.get_session_state()
                     status_payload = {
                         "hasData": has_data,
                         "latestTs": latest_ts,
                         "sampleRateHz": round(1.0 / poll_interval, 4),
                         "historyAvailable": history_available,
                         "deviceState": device_state,
+                        "currentSessionId": session_state.get("current_session_id"),
+                        "currentSessionStartTs": session_state.get("current_session_start_ts"),
+                        "lastSessionId": session_state.get("last_session_id"),
+                        "sessionTimeoutSeconds": session_state.get("session_timeout_seconds"),
                     }
                     await send_envelope(ws, "status", status_payload, request_id=request_id)
+                elif msg_type == "sessions_request":
+                    if not request_id:
+                        await send_error(ws, "missing_request_id", "sessions_request requires requestId.")
+                        continue
+                    if not isinstance(payload, dict):
+                        await send_error(ws, "invalid_payload", "sessions_request payload must be an object.", request_id)
+                        continue
+                    limit = payload.get("limit", 20)
+                    try:
+                        limit = int(limit)
+                    except (TypeError, ValueError):
+                        await send_error(ws, "invalid_payload", "limit must be an integer.", request_id)
+                        continue
+                    if limit <= 0:
+                        limit = 20
+                    if limit > 100:
+                        limit = 100
+                    sessions = await history.list_sessions(limit)
+                    await send_envelope(
+                        ws,
+                        "sessions",
+                        {"sessions": sessions},
+                        request_id=request_id,
+                    )
                 elif msg_type == "history_request":
                     if not request_id:
                         await send_error(ws, "missing_request_id", "history_request requires requestId.")
@@ -990,19 +1251,22 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     since_ts = payload.get("sinceTs")
                     until_ts = payload.get("untilTs")
                     limit = payload.get("limit")
+                    session_id = payload.get("sessionId")
                     chunk_size = payload.get("chunkSize", 200)
                     try:
                         if limit is not None:
                             limit = int(limit)
+                        if session_id is not None:
+                            session_id = int(session_id)
                         chunk_size = int(chunk_size)
                     except (TypeError, ValueError):
-                        await send_error(ws, "invalid_payload", "limit and chunkSize must be integers.", request_id)
+                        await send_error(ws, "invalid_payload", "limit, sessionId, and chunkSize must be integers.", request_id)
                         continue
                     if limit is not None and limit <= 0:
                         limit = None
                     if chunk_size <= 0:
                         chunk_size = 200
-                    items = await history.get_history_items(since_ts, until_ts, limit)
+                    items = await history.get_history_items(since_ts, until_ts, limit, session_id)
                     count = 0
                     latest_ts = None
                     chunk: List[Dict[str, object]] = []
@@ -1031,6 +1295,40 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                         {"count": count, "latestTs": latest_ts},
                         request_id=request_id,
                     )
+                elif msg_type == "session_start_request":
+                    if not request_id:
+                        await send_error(ws, "missing_request_id", "session_start_request requires requestId.")
+                        continue
+                    if not authorized:
+                        await send_error(
+                            ws,
+                            "unauthorized",
+                            "Not allowed to start a new session",
+                            request_id=request_id,
+                        )
+                        continue
+                    now_ts = now_iso_utc()
+                    session_info = await history.force_new_session(now_ts, "all", "user")
+                    if session_info.get("end_event"):
+                        await store.publish_event(make_envelope("session_end", session_info["end_event"]))
+                    await store.publish_event(make_envelope("session_start", session_info["start_event"]))
+                    snapshot = await store.snapshot()
+                    for address in snapshot.keys():
+                        await store.upsert(
+                            address,
+                            session_id=session_info["session_id"],
+                            session_start_ts=session_info["session_start_ts"],
+                        )
+                    await send_envelope(
+                        ws,
+                        "session_start_ack",
+                        {
+                            "ok": True,
+                            "sessionId": session_info["session_id"],
+                            "sessionStartTs": session_info["session_start_ts"],
+                        },
+                        request_id=request_id,
+                    )
                 else:
                     await send_error(
                         ws,
@@ -1051,7 +1349,15 @@ async def broadcast_readings(app: web.Application) -> None:
     while True:
         reading = await store.next_reading()
         message = make_envelope("reading", reading["payload"], seq=reading.get("seq"))
-        hub.broadcast(message)
+        hub.broadcast(message, critical=False)
+
+
+async def broadcast_events(app: web.Application) -> None:
+    store: DeviceStore = app["store"]
+    hub: WebSocketHub = app["hub"]
+    while True:
+        event = await store.next_event()
+        hub.broadcast(event, critical=True)
 
 
 async def start_server(
@@ -1119,6 +1425,7 @@ async def run() -> None:
     runner, app = await start_server(store, history, bind_address, port)
     app["poll_interval"] = poll_interval
     broadcast_task = asyncio.create_task(broadcast_readings(app))
+    event_task = asyncio.create_task(broadcast_events(app))
     scan_task = asyncio.create_task(manager.scan_loop())
 
     stop_event = asyncio.Event()
@@ -1132,8 +1439,10 @@ async def run() -> None:
     await stop_event.wait()
     scan_task.cancel()
     broadcast_task.cancel()
+    event_task.cancel()
     await asyncio.gather(scan_task, return_exceptions=True)
     await asyncio.gather(broadcast_task, return_exceptions=True)
+    await asyncio.gather(event_task, return_exceptions=True)
     for client in list(app["hub"].clients):
         await app["hub"].remove(client)
     await manager.stop()

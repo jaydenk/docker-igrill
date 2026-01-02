@@ -21,6 +21,7 @@ To override defaults with a file, copy `env.example` to `.env` and edit values.
 - `IGRILL_LOG_LEVEL` (default `INFO`): set to `DEBUG` for BLE connection and sensor read logs.
 - `IGRILL_RECONNECT_GRACE` (default `60`): seconds to keep the same session after a disconnect.
 - `IGRILL_DB_PATH` (default `/data/igrill.db`): SQLite database path for session history.
+- `IGRILL_SESSION_TOKEN` (default empty): optional bearer token for session control via WebSocket.
 
 | Variable | Default | Possible values | Notes |
 | --- | --- | --- | --- |
@@ -34,6 +35,7 @@ To override defaults with a file, copy `env.example` to `.env` and edit values.
 | `IGRILL_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | Controls log verbosity for the service and BLE layer. |
 | `IGRILL_RECONNECT_GRACE` | `60` | integer (>=0) | Reuse the same session if a reconnect happens within this window. |
 | `IGRILL_DB_PATH` | `/data/igrill.db` | file path | SQLite DB location for persisted history. |
+| `IGRILL_SESSION_TOKEN` | empty | string | If set, require `Authorization: Bearer <token>` on WebSocket to start sessions. |
 
 ## API
 `GET /metrics` returns the latest readings for all discovered devices.
