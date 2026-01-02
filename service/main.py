@@ -721,8 +721,6 @@ class DeviceWorker:
             session_id = session_info["session_id"]
             session_start_ts = session_info["session_start_ts"]
             self._session_id = session_id
-            payload["session_id"] = session_id
-            payload["session_start_ts"] = session_start_ts
             await self.store.upsert(
                 self.address,
                 session_id=session_id,
