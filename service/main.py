@@ -131,6 +131,8 @@ class DeviceStore:
                     "propane_percent": None,
                     "probes": [],
                     "pulse": {},
+                    "connected_probes": [],
+                    "probe_status": "unknown",
                     "error": None,
                     "rssi": None,
                 },
@@ -476,13 +478,11 @@ class DeviceWorker:
             probe = parse_temperature_probe(index, probe_data)
             probes.append(probe)
         payload["probes"] = probes
+        connected_probes = [probe["index"] for probe in probes if probe.get("unplugged") is False]
+        payload["connected_probes"] = connected_probes
+        payload["probe_status"] = "probes_connected" if connected_probes else "no_probes_connected"
         device_label = self.name or (self._model.label if self._model else "unknown")
         if not self._connected_logged:
-            connected_probes = [
-                probe["index"]
-                for probe in probes
-                if probe.get("unplugged") is False
-            ]
             LOG.info(
                 "%s mac_address: %s connected_probes: %s",
                 device_label,

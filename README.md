@@ -61,6 +61,8 @@ Example response:
       "probes": [
         { "index": 1, "temperature": 145.0, "raw": 145, "unplugged": false }
       ],
+      "connected_probes": [1],
+      "probe_status": "probes_connected",
       "pulse": {},
       "error": null,
       "rssi": -62
