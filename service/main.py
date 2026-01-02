@@ -555,22 +555,43 @@ class DeviceManager:
                 devices = await BleakScanner.discover(timeout=self.scan_timeout, return_adv=True)
                 scan_items = []
                 if isinstance(devices, dict):
-                    scan_items = [(device, adv_data) for device, adv_data in devices.items()]
-                elif isinstance(devices, list):
-                    for entry in devices:
-                        if isinstance(entry, tuple):
-                            if len(entry) >= 2:
-                                scan_items.append((entry[0], entry[1]))
-                            else:
-                                scan_items.append((entry[0], None))
+                    for key, value in devices.items():
+                        device = None
+                        adv_data = None
+                        if isinstance(value, tuple):
+                            device = value[0]
+                            adv_data = value[1] if len(value) > 1 else None
+                        elif hasattr(value, "address"):
+                            device = value
                         else:
-                            scan_items.append((entry, None))
-                for device, adv_data in scan_items:
-                    if not device.address:
-                        continue
-                    address = device.address
-                    name = device.name or (getattr(adv_data, "local_name", None) if adv_data else None)
-                    rssi = getattr(adv_data, "rssi", None) if adv_data else None
+                            adv_data = value
+                        address = getattr(device, "address", None) or (key if isinstance(key, str) else None)
+                        name = getattr(device, "name", None) or (getattr(adv_data, "local_name", None) if adv_data else None)
+                        rssi = getattr(adv_data, "rssi", None) if adv_data else None
+                        if address:
+                            scan_items.append((address, name, rssi))
+                else:
+                    for entry in devices:
+                        device = None
+                        adv_data = None
+                        address = None
+                        name = None
+                        rssi = None
+                        if isinstance(entry, tuple):
+                            device = entry[0]
+                            adv_data = entry[1] if len(entry) > 1 else None
+                            address = getattr(device, "address", None)
+                            name = getattr(device, "name", None) or (getattr(adv_data, "local_name", None) if adv_data else None)
+                            rssi = getattr(adv_data, "rssi", None) if adv_data else None
+                        elif hasattr(entry, "address"):
+                            device = entry
+                            address = getattr(device, "address", None)
+                            name = getattr(device, "name", None)
+                        elif isinstance(entry, str):
+                            address = entry
+                        if address:
+                            scan_items.append((address, name, rssi))
+                for address, name, rssi in scan_items:
                     if not address.lower().startswith(self.mac_prefix):
                         continue
                     LOG.debug("Discovered %s (%s) rssi=%s", address, name, rssi)
