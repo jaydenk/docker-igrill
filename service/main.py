@@ -6,7 +6,7 @@ import signal
 import sqlite3
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from aiohttp import web
@@ -82,6 +82,10 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def now_iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def parse_iso(timestamp: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(timestamp)
@@ -111,7 +115,7 @@ class DeviceStore:
     def __init__(self) -> None:
         self._devices: Dict[str, Dict[str, object]] = {}
         self._lock = asyncio.Lock()
-        self._updates: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=1000)
+        self._reading_queue: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=1000)
 
     async def upsert(self, address: str, **fields: object) -> None:
         async with self._lock:
@@ -138,25 +142,27 @@ class DeviceStore:
                 },
             )
             entry.update(fields)
-            if "last_update" in fields:
-                payload = {
-                    "type": "device_update",
-                    "generated_at": now_iso(),
-                    "device": dict(entry),
-                }
-                if self._updates.full():
-                    try:
-                        self._updates.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                self._updates.put_nowait(payload)
 
     async def snapshot(self) -> Dict[str, Dict[str, object]]:
         async with self._lock:
             return {key: dict(value) for key, value in self._devices.items()}
 
-    async def next_update(self) -> Dict[str, object]:
-        return await self._updates.get()
+    async def get_device(self, address: str) -> Optional[Dict[str, object]]:
+        async with self._lock:
+            if address not in self._devices:
+                return None
+            return dict(self._devices[address])
+
+    async def publish_reading(self, reading: Dict[str, object]) -> None:
+        if self._reading_queue.full():
+            try:
+                self._reading_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        self._reading_queue.put_nowait(reading)
+
+    async def next_reading(self) -> Dict[str, object]:
+        return await self._reading_queue.get()
 
 
 class HistoryStore:
@@ -191,18 +197,30 @@ class HistoryStore:
                 session_id INTEGER NOT NULL,
                 address TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
+                seq INTEGER,
                 unit TEXT,
                 battery_percent REAL,
                 propane_percent REAL,
                 pulse_json TEXT,
                 probes_json TEXT,
+                data_json TEXT,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             )
             """
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_address ON sessions(address)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_session ON readings(session_id)")
+        self._ensure_column("readings", "seq", "seq INTEGER")
+        self._ensure_column("readings", "data_json", "data_json TEXT")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     async def ensure_session(
         self,
@@ -270,7 +288,14 @@ class HistoryStore:
             )
             self._conn.commit()
 
-    async def record_reading(self, session_id: int, address: str, payload: Dict[str, object]) -> None:
+    async def record_reading(
+        self,
+        session_id: int,
+        address: str,
+        payload: Dict[str, object],
+        reading_data: Dict[str, object],
+        seq: int,
+    ) -> None:
         async with self._lock:
             self._conn.execute(
                 """
@@ -278,22 +303,26 @@ class HistoryStore:
                     session_id,
                     address,
                     recorded_at,
+                    seq,
                     unit,
                     battery_percent,
                     propane_percent,
                     pulse_json,
-                    probes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    probes_json,
+                    data_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     address,
                     payload.get("last_update"),
+                    seq,
                     payload.get("unit"),
                     payload.get("battery_percent"),
                     payload.get("propane_percent"),
                     json.dumps(payload.get("pulse", {})),
                     json.dumps(payload.get("probes", [])),
+                    json.dumps(reading_data),
                 ),
             )
             self._conn.commit()
@@ -338,6 +367,65 @@ class HistoryStore:
                 )
             return sessions
 
+    async def has_history(self) -> bool:
+        async with self._lock:
+            row = self._conn.execute("SELECT 1 FROM readings LIMIT 1").fetchone()
+            return row is not None
+
+    async def latest_ts(self) -> Optional[str]:
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT recorded_at FROM readings ORDER BY recorded_at DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                return row["recorded_at"]
+            return None
+
+    async def get_history_items(
+        self,
+        since_ts: Optional[str],
+        until_ts: Optional[str],
+        limit: Optional[int],
+    ) -> List[Dict[str, object]]:
+        query = "SELECT * FROM readings WHERE 1=1"
+        params: List[object] = []
+        if since_ts:
+            query += " AND recorded_at >= ?"
+            params.append(since_ts)
+        if until_ts:
+            query += " AND recorded_at <= ?"
+            params.append(until_ts)
+        query += " ORDER BY recorded_at ASC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        async with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        items = []
+        for row in rows:
+            data_json = row["data_json"]
+            if data_json:
+                data = json.loads(data_json)
+            else:
+                data = {
+                    "sensorId": row["address"],
+                    "data": {
+                        "unit": row["unit"],
+                        "battery_percent": row["battery_percent"],
+                        "propane_percent": row["propane_percent"],
+                        "pulse": json.loads(row["pulse_json"] or "{}"),
+                        "probes": json.loads(row["probes_json"] or "[]"),
+                    },
+                }
+            items.append(
+                {
+                    "ts": row["recorded_at"],
+                    "seq": row["seq"],
+                    "data": data,
+                }
+            )
+        return items
+
 
 class DeviceWorker:
     def __init__(
@@ -359,6 +447,7 @@ class DeviceWorker:
         self._stop = asyncio.Event()
         self._connected_logged = False
         self._session_id: Optional[int] = None
+        self._seq = 0
 
     def update_name(self, name: Optional[str]) -> None:
         if name:
@@ -452,7 +541,19 @@ class DeviceWorker:
             payload = await self._read_metrics(client, services, probe_uuids)
             payload["session_id"] = session_id
             await self.store.upsert(self.address, **payload)
-            await self.history.record_reading(session_id, self.address, payload)
+            self._seq += 1
+            device_entry = await self.store.get_device(self.address)
+            if device_entry is None:
+                await asyncio.sleep(self.poll_interval)
+                continue
+            reading_payload = build_reading_payload(device_entry)
+            await self.store.publish_reading(
+                {
+                    "seq": self._seq,
+                    "payload": reading_payload,
+                }
+            )
+            await self.history.record_reading(session_id, self.address, payload, reading_payload, self._seq)
             await asyncio.sleep(self.poll_interval)
 
     async def _read_metrics(self, client: BleakClient, services, probe_uuids: List[str]) -> Dict[str, object]:
@@ -629,6 +730,54 @@ class DeviceManager:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
 
 
+class WebSocketClient:
+    def __init__(self, ws: web.WebSocketResponse, queue_size: int = 1) -> None:
+        self.ws = ws
+        self.queue: asyncio.Queue[Dict[str, object]] = asyncio.Queue(maxsize=queue_size)
+        self.task = asyncio.create_task(self._sender())
+
+    async def _sender(self) -> None:
+        while True:
+            message = await self.queue.get()
+            if self.ws.closed:
+                break
+            await self.ws.send_json(message)
+
+    def enqueue(self, message: Dict[str, object]) -> None:
+        if self.queue.full():
+            while not self.queue.empty():
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        self.queue.put_nowait(message)
+
+    async def close(self) -> None:
+        if not self.task.done():
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+
+
+class WebSocketHub:
+    def __init__(self) -> None:
+        self.clients: set[WebSocketClient] = set()
+
+    def add(self, client: WebSocketClient) -> None:
+        self.clients.add(client)
+
+    async def remove(self, client: WebSocketClient) -> None:
+        if client in self.clients:
+            self.clients.remove(client)
+        await client.close()
+
+    def broadcast(self, message: Dict[str, object]) -> None:
+        for client in list(self.clients):
+            if client.ws.closed:
+                self.clients.discard(client)
+                continue
+            client.enqueue(message)
+
+
 def detect_model(services) -> Optional[ModelInfo]:
     service_uuids = {service.uuid.lower() for service in services}
     for model in MODELS:
@@ -667,6 +816,77 @@ def parse_pulse_element(data: bytes) -> Dict[str, Optional[int]]:
     }
 
 
+def build_reading_payload(device_entry: Dict[str, object]) -> Dict[str, object]:
+    data = {
+        "name": device_entry.get("name"),
+        "model": device_entry.get("model"),
+        "model_name": device_entry.get("model_name"),
+        "session_id": device_entry.get("session_id"),
+        "last_update": device_entry.get("last_update"),
+        "unit": device_entry.get("unit"),
+        "battery_percent": device_entry.get("battery_percent"),
+        "propane_percent": device_entry.get("propane_percent"),
+        "probes": device_entry.get("probes", []),
+        "connected_probes": device_entry.get("connected_probes", []),
+        "probe_status": device_entry.get("probe_status"),
+        "pulse": device_entry.get("pulse", {}),
+        "error": device_entry.get("error"),
+    }
+    payload = {
+        "sensorId": device_entry.get("address"),
+        "data": data,
+    }
+    q = {
+        "rssi": device_entry.get("rssi"),
+        "batteryPct": device_entry.get("battery_percent"),
+    }
+    if q["rssi"] is not None or q["batteryPct"] is not None:
+        payload["q"] = q
+    return payload
+
+
+def make_envelope(
+    msg_type: str,
+    payload: Dict[str, object],
+    request_id: Optional[str] = None,
+    seq: Optional[int] = None,
+) -> Dict[str, object]:
+    envelope: Dict[str, object] = {
+        "v": 1,
+        "type": msg_type,
+        "ts": now_iso_utc(),
+        "payload": payload,
+    }
+    if request_id:
+        envelope["requestId"] = request_id
+    if seq is not None:
+        envelope["seq"] = seq
+    return envelope
+
+
+async def send_envelope(
+    ws: web.WebSocketResponse,
+    msg_type: str,
+    payload: Dict[str, object],
+    request_id: Optional[str] = None,
+    seq: Optional[int] = None,
+) -> None:
+    await ws.send_json(make_envelope(msg_type, payload, request_id=request_id, seq=seq))
+
+
+async def send_error(
+    ws: web.WebSocketResponse,
+    code: str,
+    message: str,
+    request_id: Optional[str] = None,
+    details: Optional[Dict[str, object]] = None,
+) -> None:
+    payload: Dict[str, object] = {"code": code, "message": message}
+    if details:
+        payload["details"] = details
+    await send_envelope(ws, "error", payload, request_id=request_id)
+
+
 async def metrics_handler(request: web.Request) -> web.Response:
     store: DeviceStore = request.app["store"]
     snapshot = await store.snapshot()
@@ -691,56 +911,147 @@ async def history_handler(request: web.Request) -> web.Response:
     )
 
 
+# WebSocket examples:
+# Client status request:
+# {"v":1,"type":"status_request","requestId":"s-1","payload":{}}
+# Server status response:
+# {"v":1,"type":"status","ts":"2026-01-02T01:00:00Z","requestId":"s-1","payload":{"hasData":true,"latestTs":"2026-01-02T01:00:00+00:00","historyAvailable":true}}
+# Client history request:
+# {"v":1,"type":"history_request","requestId":"h-1","payload":{"sinceTs":"2026-01-02T00:00:00+00:00","chunkSize":200}}
+# Server history chunk:
+# {"v":1,"type":"history_chunk","ts":"2026-01-02T01:00:00Z","requestId":"h-1","payload":{"items":[{"ts":"2026-01-02T01:00:00+00:00","seq":1,"data":{"sensorId":"70:91:8F:...","data":{"probes":[]}}}]}}
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     store: DeviceStore = request.app["store"]
     history: HistoryStore = request.app["history"]
-    websockets: set = request.app["websockets"]
+    hub: WebSocketHub = request.app["hub"]
+    poll_interval: int = request.app["poll_interval"]
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    websockets.add(ws)
-    snapshot = await store.snapshot()
-    await ws.send_json(
-        {
-            "type": "snapshot",
-            "generated_at": now_iso(),
-            "devices": list(snapshot.values()),
-        }
-    )
-    sessions = await history.get_history()
-    await ws.send_json(
-        {
-            "type": "history",
-            "generated_at": now_iso(),
-            "sessions": sessions,
-        }
-    )
+    client = WebSocketClient(ws)
+    hub.add(client)
     try:
         async for msg in ws:
-            if msg.type == web.WSMsgType.ERROR:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await send_error(ws, "invalid_json", "Message must be valid JSON.")
+                    continue
+                if not isinstance(data, dict):
+                    await send_error(ws, "invalid_message", "Message must be a JSON object.")
+                    continue
+                if data.get("v") != 1:
+                    await send_error(ws, "unsupported_version", "Unsupported message version.")
+                    continue
+                msg_type = data.get("type")
+                request_id = data.get("requestId")
+                payload = data.get("payload") or {}
+                if msg_type == "status_request":
+                    if not request_id:
+                        await send_error(ws, "missing_request_id", "status_request requires requestId.")
+                        continue
+                    snapshot = await store.snapshot()
+                    has_data = any(device.get("last_update") for device in snapshot.values())
+                    latest_ts = None
+                    if has_data:
+                        latest_ts = max(
+                            device.get("last_update")
+                            for device in snapshot.values()
+                            if device.get("last_update")
+                        )
+                    history_available = await history.has_history()
+                    if latest_ts is None and history_available:
+                        latest_ts = await history.latest_ts()
+                    any_connected = any(device.get("connected") for device in snapshot.values())
+                    any_error = any(device.get("error") for device in snapshot.values())
+                    if any_error:
+                        device_state = "error"
+                    elif any_connected and has_data:
+                        device_state = "ok"
+                    elif any_connected and not has_data:
+                        device_state = "warming_up"
+                    else:
+                        device_state = "offline"
+                    status_payload = {
+                        "hasData": has_data,
+                        "latestTs": latest_ts,
+                        "sampleRateHz": round(1.0 / poll_interval, 4),
+                        "historyAvailable": history_available,
+                        "deviceState": device_state,
+                    }
+                    await send_envelope(ws, "status", status_payload, request_id=request_id)
+                elif msg_type == "history_request":
+                    if not request_id:
+                        await send_error(ws, "missing_request_id", "history_request requires requestId.")
+                        continue
+                    if not isinstance(payload, dict):
+                        await send_error(ws, "invalid_payload", "history_request payload must be an object.", request_id)
+                        continue
+                    since_ts = payload.get("sinceTs")
+                    until_ts = payload.get("untilTs")
+                    limit = payload.get("limit")
+                    chunk_size = payload.get("chunkSize", 200)
+                    try:
+                        if limit is not None:
+                            limit = int(limit)
+                        chunk_size = int(chunk_size)
+                    except (TypeError, ValueError):
+                        await send_error(ws, "invalid_payload", "limit and chunkSize must be integers.", request_id)
+                        continue
+                    if limit is not None and limit <= 0:
+                        limit = None
+                    if chunk_size <= 0:
+                        chunk_size = 200
+                    items = await history.get_history_items(since_ts, until_ts, limit)
+                    count = 0
+                    latest_ts = None
+                    chunk: List[Dict[str, object]] = []
+                    for item in items:
+                        chunk.append(item)
+                        count += 1
+                        latest_ts = item.get("ts") or latest_ts
+                        if len(chunk) >= chunk_size:
+                            await send_envelope(
+                                ws,
+                                "history_chunk",
+                                {"items": chunk},
+                                request_id=request_id,
+                            )
+                            chunk = []
+                    if chunk:
+                        await send_envelope(
+                            ws,
+                            "history_chunk",
+                            {"items": chunk},
+                            request_id=request_id,
+                        )
+                    await send_envelope(
+                        ws,
+                        "history_end",
+                        {"count": count, "latestTs": latest_ts},
+                        request_id=request_id,
+                    )
+                else:
+                    await send_error(
+                        ws,
+                        "unknown_type",
+                        f"Unsupported message type: {msg_type}",
+                        request_id=request_id,
+                    )
+            elif msg.type == web.WSMsgType.ERROR:
                 LOG.debug("WebSocket error: %s", ws.exception())
     finally:
-        websockets.discard(ws)
+        await hub.remove(client)
     return ws
 
 
-async def broadcast_updates(app: web.Application) -> None:
+async def broadcast_readings(app: web.Application) -> None:
     store: DeviceStore = app["store"]
-    websockets: set = app["websockets"]
+    hub: WebSocketHub = app["hub"]
     while True:
-        update = await store.next_update()
-        if not websockets:
-            continue
-        stale = []
-        for ws in websockets:
-            if ws.closed:
-                stale.append(ws)
-                continue
-            try:
-                await ws.send_json(update)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            websockets.discard(ws)
+        reading = await store.next_reading()
+        message = make_envelope("reading", reading["payload"], seq=reading.get("seq"))
+        hub.broadcast(message)
 
 
 async def start_server(
@@ -752,7 +1063,7 @@ async def start_server(
     app = web.Application()
     app["store"] = store
     app["history"] = history
-    app["websockets"] = set()
+    app["hub"] = WebSocketHub()
     app.router.add_get("/metrics", metrics_handler)
     app.router.add_get("/history", history_handler)
     app.router.add_get("/ws", websocket_handler)
@@ -806,7 +1117,8 @@ async def run() -> None:
     )
 
     runner, app = await start_server(store, history, bind_address, port)
-    broadcast_task = asyncio.create_task(broadcast_updates(app))
+    app["poll_interval"] = poll_interval
+    broadcast_task = asyncio.create_task(broadcast_readings(app))
     scan_task = asyncio.create_task(manager.scan_loop())
 
     stop_event = asyncio.Event()
@@ -822,8 +1134,8 @@ async def run() -> None:
     broadcast_task.cancel()
     await asyncio.gather(scan_task, return_exceptions=True)
     await asyncio.gather(broadcast_task, return_exceptions=True)
-    for ws in list(app["websockets"]):
-        await ws.close()
+    for client in list(app["hub"].clients):
+        await app["hub"].remove(client)
     await manager.stop()
     await runner.cleanup()
 
