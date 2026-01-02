@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import sqlite3
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -372,6 +373,10 @@ class DeviceWorker:
                     self._connected_logged = False
                     services = client.services
                     if services is None:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", category=FutureWarning)
+                            services = await client.get_services()
+                    if services is None:
                         LOG.warning("No services discovered for %s", self.address)
                         await self.store.upsert(self.address, connected=False, error="services_unavailable")
                         await asyncio.sleep(3)
@@ -548,12 +553,24 @@ class DeviceManager:
         while True:
             try:
                 devices = await BleakScanner.discover(timeout=self.scan_timeout, return_adv=True)
-                for device, adv_data in devices:
+                scan_items = []
+                if isinstance(devices, dict):
+                    scan_items = [(device, adv_data) for device, adv_data in devices.items()]
+                elif isinstance(devices, list):
+                    for entry in devices:
+                        if isinstance(entry, tuple):
+                            if len(entry) >= 2:
+                                scan_items.append((entry[0], entry[1]))
+                            else:
+                                scan_items.append((entry[0], None))
+                        else:
+                            scan_items.append((entry, None))
+                for device, adv_data in scan_items:
                     if not device.address:
                         continue
                     address = device.address
-                    name = device.name or getattr(adv_data, "local_name", None)
-                    rssi = getattr(adv_data, "rssi", None)
+                    name = device.name or (getattr(adv_data, "local_name", None) if adv_data else None)
+                    rssi = getattr(adv_data, "rssi", None) if adv_data else None
                     if not address.lower().startswith(self.mac_prefix):
                         continue
                     LOG.debug("Discovered %s (%s) rssi=%s", address, name, rssi)
