@@ -3,8 +3,9 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from aiohttp import web
@@ -49,6 +50,8 @@ MIN_POLL_INTERVAL = 5
 MAX_POLL_INTERVAL = 60
 DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_SCAN_TIMEOUT = 5
+DEFAULT_RECONNECT_GRACE = 60
+DEFAULT_DB_PATH = "/data/igrill.db"
 
 LOG = logging.getLogger("igrill")
 
@@ -76,6 +79,13 @@ MODELS: List[ModelInfo] = [
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
+
+
+def parse_iso(timestamp: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
 
 
 def clamp_int(value: int, min_value: int, max_value: int) -> int:
@@ -112,6 +122,7 @@ class DeviceStore:
                     "model": None,
                     "model_name": None,
                     "connected": False,
+                    "session_id": None,
                     "last_seen": None,
                     "last_update": None,
                     "unit": None,
@@ -145,23 +156,206 @@ class DeviceStore:
         return await self._updates.get()
 
 
+class HistoryStore:
+    def __init__(self, db_path: str, reconnect_grace: int) -> None:
+        self._db_path = db_path
+        self._reconnect_grace = reconnect_grace
+        self._lock = asyncio.Lock()
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL,
+                name TEXT,
+                model TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                unit TEXT,
+                battery_percent REAL,
+                propane_percent REAL,
+                pulse_json TEXT,
+                probes_json TEXT,
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_address ON sessions(address)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_session ON readings(session_id)")
+        self._conn.commit()
+
+    async def ensure_session(
+        self,
+        address: str,
+        name: Optional[str],
+        model: Optional[str],
+        now_value: str,
+    ) -> int:
+        now_dt = parse_iso(now_value) or datetime.now().astimezone()
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ended_at FROM sessions WHERE address = ? ORDER BY started_at DESC LIMIT 1",
+                (address,),
+            ).fetchone()
+            session_id = None
+            if row:
+                ended_at = row["ended_at"]
+                if ended_at is None:
+                    last_read = self._conn.execute(
+                        "SELECT recorded_at FROM readings WHERE session_id = ? ORDER BY recorded_at DESC LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    last_read_dt = parse_iso(last_read["recorded_at"]) if last_read else None
+                    if last_read_dt and (now_dt - last_read_dt).total_seconds() > self._reconnect_grace:
+                        self._conn.execute(
+                            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                            (last_read["recorded_at"], row["id"]),
+                        )
+                    else:
+                        session_id = row["id"]
+                else:
+                    ended_dt = parse_iso(ended_at)
+                    if ended_dt and (now_dt - ended_dt).total_seconds() <= self._reconnect_grace:
+                        self._conn.execute("UPDATE sessions SET ended_at = NULL WHERE id = ?", (row["id"],))
+                        session_id = row["id"]
+
+            if session_id is None:
+                self._conn.execute(
+                    "INSERT INTO sessions (address, name, model, started_at) VALUES (?, ?, ?, ?)",
+                    (address, name, model, now_value),
+                )
+                session_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            else:
+                self._conn.execute(
+                    "UPDATE sessions SET name = ?, model = ? WHERE id = ?",
+                    (name, model, session_id),
+                )
+            self._conn.commit()
+            return int(session_id)
+
+    async def close_session(self, address: str, ended_at: str) -> None:
+        async with self._lock:
+            self._conn.execute(
+                """
+                UPDATE sessions
+                SET ended_at = ?
+                WHERE id = (
+                    SELECT id FROM sessions
+                    WHERE address = ? AND ended_at IS NULL
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                )
+                """,
+                (ended_at, address),
+            )
+            self._conn.commit()
+
+    async def record_reading(self, session_id: int, address: str, payload: Dict[str, object]) -> None:
+        async with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO readings (
+                    session_id,
+                    address,
+                    recorded_at,
+                    unit,
+                    battery_percent,
+                    propane_percent,
+                    pulse_json,
+                    probes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    address,
+                    payload.get("last_update"),
+                    payload.get("unit"),
+                    payload.get("battery_percent"),
+                    payload.get("propane_percent"),
+                    json.dumps(payload.get("pulse", {})),
+                    json.dumps(payload.get("probes", [])),
+                ),
+            )
+            self._conn.commit()
+
+    async def get_history(self, address: Optional[str] = None) -> List[Dict[str, object]]:
+        async with self._lock:
+            if address:
+                session_rows = self._conn.execute(
+                    "SELECT * FROM sessions WHERE address = ? ORDER BY started_at ASC",
+                    (address,),
+                ).fetchall()
+            else:
+                session_rows = self._conn.execute(
+                    "SELECT * FROM sessions ORDER BY started_at ASC"
+                ).fetchall()
+            sessions = []
+            for session in session_rows:
+                readings = self._conn.execute(
+                    "SELECT * FROM readings WHERE session_id = ? ORDER BY recorded_at ASC",
+                    (session["id"],),
+                ).fetchall()
+                sessions.append(
+                    {
+                        "session_id": session["id"],
+                        "address": session["address"],
+                        "name": session["name"],
+                        "model": session["model"],
+                        "started_at": session["started_at"],
+                        "ended_at": session["ended_at"],
+                        "readings": [
+                            {
+                                "recorded_at": reading["recorded_at"],
+                                "unit": reading["unit"],
+                                "battery_percent": reading["battery_percent"],
+                                "propane_percent": reading["propane_percent"],
+                                "pulse": json.loads(reading["pulse_json"] or "{}"),
+                                "probes": json.loads(reading["probes_json"] or "[]"),
+                            }
+                            for reading in readings
+                        ],
+                    }
+                )
+            return sessions
+
+
 class DeviceWorker:
     def __init__(
         self,
         address: str,
         name: Optional[str],
         store: DeviceStore,
+        history: HistoryStore,
         poll_interval: int,
         timeout: int,
     ) -> None:
         self.address = address
         self.name = name
         self.store = store
+        self.history = history
         self.poll_interval = poll_interval
         self.timeout = timeout
         self._model: Optional[ModelInfo] = None
         self._stop = asyncio.Event()
         self._connected_logged = False
+        self._session_id: Optional[int] = None
 
     def update_name(self, name: Optional[str]) -> None:
         if name:
@@ -176,12 +370,19 @@ class DeviceWorker:
                 LOG.debug("Connecting to %s (%s)", self.address, self.name or "unknown")
                 async with BleakClient(self.address, timeout=self.timeout) as client:
                     self._connected_logged = False
-                    services = await client.get_services()
+                    services = client.services
+                    if services is None:
+                        LOG.warning("No services discovered for %s", self.address)
+                        await self.store.upsert(self.address, connected=False, error="services_unavailable")
+                        await asyncio.sleep(3)
+                        continue
                     self._model = detect_model(services)
                     await self._update_model_state()
                     await self._authenticate(client, services)
                     await self._poll_loop(client, services)
                     await self.store.upsert(self.address, connected=False)
+                    await self.history.close_session(self.address, now_iso())
+                    self._session_id = None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -191,6 +392,9 @@ class DeviceWorker:
                     connected=False,
                     error=str(exc),
                 )
+                if self._session_id is not None:
+                    await self.history.close_session(self.address, now_iso())
+                    self._session_id = None
                 await asyncio.sleep(3)
 
     async def _update_model_state(self) -> None:
@@ -229,9 +433,19 @@ class DeviceWorker:
         probe_uuids = []
         if self._model:
             probe_uuids = PROBE_TEMPERATURE_UUIDS[: self._model.probe_count]
+        session_id = await self.history.ensure_session(
+            self.address,
+            self.name,
+            self._model.model_id if self._model else None,
+            now_iso(),
+        )
+        self._session_id = session_id
+        await self.store.upsert(self.address, session_id=session_id)
         while client.is_connected and not self._stop.is_set():
             payload = await self._read_metrics(client, services, probe_uuids)
+            payload["session_id"] = session_id
             await self.store.upsert(self.address, **payload)
+            await self.history.record_reading(session_id, self.address, payload)
             await asyncio.sleep(self.poll_interval)
 
     async def _read_metrics(self, client: BleakClient, services, probe_uuids: List[str]) -> Dict[str, object]:
@@ -313,6 +527,7 @@ class DeviceManager:
     def __init__(
         self,
         store: DeviceStore,
+        history: HistoryStore,
         poll_interval: int,
         timeout: int,
         mac_prefix: str,
@@ -320,6 +535,7 @@ class DeviceManager:
         scan_timeout: int,
     ) -> None:
         self.store = store
+        self.history = history
         self.poll_interval = poll_interval
         self.timeout = timeout
         self.mac_prefix = mac_prefix.lower()
@@ -331,26 +547,35 @@ class DeviceManager:
     async def scan_loop(self) -> None:
         while True:
             try:
-                devices = await BleakScanner.discover(timeout=self.scan_timeout)
-                for device in devices:
+                devices = await BleakScanner.discover(timeout=self.scan_timeout, return_adv=True)
+                for device, adv_data in devices:
                     if not device.address:
                         continue
                     address = device.address
+                    name = device.name or getattr(adv_data, "local_name", None)
+                    rssi = getattr(adv_data, "rssi", None)
                     if not address.lower().startswith(self.mac_prefix):
                         continue
-                    LOG.debug("Discovered %s (%s) rssi=%s", address, device.name, getattr(device, "rssi", None))
+                    LOG.debug("Discovered %s (%s) rssi=%s", address, name, rssi)
                     await self.store.upsert(
                         address,
-                        name=device.name,
+                        name=name,
                         last_seen=now_iso(),
-                        rssi=getattr(device, "rssi", None),
+                        rssi=rssi,
                     )
                     if address not in self._workers:
-                        worker = DeviceWorker(address, device.name, self.store, self.poll_interval, self.timeout)
+                        worker = DeviceWorker(
+                            address,
+                            name,
+                            self.store,
+                            self.history,
+                            self.poll_interval,
+                            self.timeout,
+                        )
                         self._workers[address] = worker
                         self._tasks[address] = asyncio.create_task(worker.run())
                     else:
-                        self._workers[address].update_name(device.name)
+                        self._workers[address].update_name(name)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -415,8 +640,22 @@ async def metrics_handler(request: web.Request) -> web.Response:
         }
     )
 
+async def history_handler(request: web.Request) -> web.Response:
+    history: HistoryStore = request.app["history"]
+    address = request.query.get("mac")
+    sessions = await history.get_history(address)
+    return web.json_response(
+        {
+            "generated_at": now_iso(),
+            "session_count": len(sessions),
+            "sessions": sessions,
+        }
+    )
+
+
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     store: DeviceStore = request.app["store"]
+    history: HistoryStore = request.app["history"]
     websockets: set = request.app["websockets"]
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
@@ -427,6 +666,14 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             "type": "snapshot",
             "generated_at": now_iso(),
             "devices": list(snapshot.values()),
+        }
+    )
+    sessions = await history.get_history()
+    await ws.send_json(
+        {
+            "type": "history",
+            "generated_at": now_iso(),
+            "sessions": sessions,
         }
     )
     try:
@@ -458,11 +705,18 @@ async def broadcast_updates(app: web.Application) -> None:
             websockets.discard(ws)
 
 
-async def start_server(store: DeviceStore, host: str, port: int) -> tuple[web.AppRunner, web.Application]:
+async def start_server(
+    store: DeviceStore,
+    history: HistoryStore,
+    host: str,
+    port: int,
+) -> tuple[web.AppRunner, web.Application]:
     app = web.Application()
     app["store"] = store
+    app["history"] = history
     app["websockets"] = set()
     app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/history", history_handler)
     app.router.add_get("/ws", websocket_handler)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -484,22 +738,28 @@ async def run() -> None:
     timeout = read_int_env("IGRILL_TIMEOUT", DEFAULT_TIMEOUT)
     scan_interval = read_int_env("IGRILL_SCAN_INTERVAL", DEFAULT_SCAN_INTERVAL)
     scan_timeout = read_int_env("IGRILL_SCAN_TIMEOUT", DEFAULT_SCAN_TIMEOUT)
+    reconnect_grace = read_int_env("IGRILL_RECONNECT_GRACE", DEFAULT_RECONNECT_GRACE)
+    db_path = os.getenv("IGRILL_DB_PATH", DEFAULT_DB_PATH)
     mac_prefix = os.getenv("IGRILL_MAC_PREFIX", "70:91:8F")
     bind_address = os.getenv("IGRILL_BIND_ADDRESS", "0.0.0.0")
 
     LOG.info(
-        "Config: port=%d poll=%ds timeout=%ds scan_interval=%ds scan_timeout=%ds mac_prefix=%s",
+        "Config: port=%d poll=%ds timeout=%ds scan_interval=%ds scan_timeout=%ds mac_prefix=%s reconnect_grace=%ds db_path=%s",
         port,
         poll_interval,
         timeout,
         scan_interval,
         scan_timeout,
         mac_prefix,
+        reconnect_grace,
+        db_path,
     )
 
     store = DeviceStore()
+    history = HistoryStore(db_path, reconnect_grace)
     manager = DeviceManager(
         store=store,
+        history=history,
         poll_interval=poll_interval,
         timeout=timeout,
         mac_prefix=mac_prefix,
@@ -507,7 +767,7 @@ async def run() -> None:
         scan_timeout=scan_timeout,
     )
 
-    runner, app = await start_server(store, bind_address, port)
+    runner, app = await start_server(store, history, bind_address, port)
     broadcast_task = asyncio.create_task(broadcast_updates(app))
     scan_task = asyncio.create_task(manager.scan_loop())
 

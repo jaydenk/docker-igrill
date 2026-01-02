@@ -19,6 +19,8 @@ To override defaults with a file, copy `env.example` to `.env` and edit values.
 - `IGRILL_SCAN_INTERVAL` (default `60`): BLE scan interval in seconds.
 - `IGRILL_SCAN_TIMEOUT` (default `5`): BLE scan duration in seconds.
 - `IGRILL_LOG_LEVEL` (default `INFO`): set to `DEBUG` for BLE connection and sensor read logs.
+- `IGRILL_RECONNECT_GRACE` (default `60`): seconds to keep the same session after a disconnect.
+- `IGRILL_DB_PATH` (default `/data/igrill.db`): SQLite database path for session history.
 
 | Variable | Default | Possible values | Notes |
 | --- | --- | --- | --- |
@@ -30,9 +32,14 @@ To override defaults with a file, copy `env.example` to `.env` and edit values.
 | `IGRILL_SCAN_INTERVAL` | `60` | integer (>=1) | Time between BLE scans in seconds. |
 | `IGRILL_SCAN_TIMEOUT` | `5` | integer (>=1) | Duration of each BLE scan in seconds. |
 | `IGRILL_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | Controls log verbosity for the service and BLE layer. |
+| `IGRILL_RECONNECT_GRACE` | `60` | integer (>=0) | Reuse the same session if a reconnect happens within this window. |
+| `IGRILL_DB_PATH` | `/data/igrill.db` | file path | SQLite DB location for persisted history. |
 
 ## API
 `GET /metrics` returns the latest readings for all discovered devices.
+`GET /history` returns all persisted sessions and readings (optional `?mac=70:91:8F:...`).
+
+History is stored in SQLite at `IGRILL_DB_PATH` (default `/data/igrill.db`). Ensure the container has a persistent `/data` volume if you want history across restarts.
 
 Example response:
 ```json
@@ -65,6 +72,7 @@ Example response:
 ### WebSocket Streaming
 For real-time streaming, connect to `/ws`. The server sends:
 - `snapshot` on connect with all known devices.
+- `history` on connect with all persisted sessions and readings.
 - `device_update` for each poll cycle with the latest readings.
 
 Note: `curl` does not support WebSockets. Use a client like `websocat` or `wscat`, or an iOS `URLSessionWebSocketTask`.

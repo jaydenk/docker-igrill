@@ -12,10 +12,16 @@ services:
       - IGRILL_SCAN_INTERVAL=${IGRILL_SCAN_INTERVAL:-60}
       - IGRILL_SCAN_TIMEOUT=${IGRILL_SCAN_TIMEOUT:-5}
       - IGRILL_LOG_LEVEL=${IGRILL_LOG_LEVEL:-INFO}
+      - IGRILL_RECONNECT_GRACE=${IGRILL_RECONNECT_GRACE:-60}
+      - IGRILL_DB_PATH=${IGRILL_DB_PATH:-/data/igrill.db}
       - DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
     ports:
       - "${IGRILL_PORT:-39120}:${IGRILL_PORT:-39120}"
     volumes:
       - /run/dbus:/run/dbus
       - /etc/localtime:/etc/localtime:ro
+      - igrill-data:/data
     restart: unless-stopped
+
+volumes:
+  igrill-data:
