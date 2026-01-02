@@ -458,7 +458,7 @@ class DeviceWorker:
 
         unit_data = await self._read_char(client, TEMPERATURE_UNIT_UUID, services)
         if unit_data:
-            payload["unit"] = "F" if unit_data[0] == 0 else "C"
+            payload["unit"] = "C" if unit_data[0] == 0 else "F"
 
         battery_data = await self._read_char(client, BATTERY_LEVEL_UUID, services)
         if battery_data:
